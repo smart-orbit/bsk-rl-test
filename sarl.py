@@ -12,6 +12,55 @@ import ray
 from ray import tune
 from ray.tune.registry import register_env
 
+# 新增：MSIS 大气和拖曳效应器
+from Basilisk.simulation import msisAtmosphere, dragDynamicEffector
+
+# 新增：基于 FullFeaturedDynModel 的自定义动力学模型，额外挂上 MSIS 大气
+class MSISDynModel(dyn.FullFeaturedDynModel):
+    """在 bsk_rl 现有动力学基础上，添加 MSIS 大气模型和对应的拖曳效应器。"""
+
+    def reset_post_sim_init(self) -> None:
+        """
+        在 bsk_rl 创建好 Simulator、世界和飞行器之后调用。
+        此时 self.simulator、self.scObject、self.task_name 都已经存在，适合挂接 Basilisk 模块。
+        """
+        # 先执行父类逻辑（保持原有行为）
+        super().reset_post_sim_init()
+
+        # 1) 创建 MSIS 大气模型
+        # 类名是 MsisAtmosphere（可以通过 inspect 确认）
+        self.msisAtmo = msisAtmosphere.MsisAtmosphere()
+        self.msisAtmo.ModelTag = "MSISAtmosphere"
+        epochMsg = unitTestSupport.timeStringToGregorianUTCMsg('2019 Jan 01 00:00:00.00 (UTC)')  # 设置大气模型的参考时间
+        self.msisAtmo.epochInMsg.subscribeTo(epochMsg)
+        # orbitalMotion.REQ_EARTH 是 [km]，转成 [m]
+        self.msisAtmo.planetRadius = orbitalMotion.REQ_EARTH * 1e3
+
+        # 如需更精细配置，可按 msisAtmosphere 源码设置太阳活动等参数
+        # 例如：
+        # self.msisAtmo.F107 = 150.0
+        # self.msisAtmo.AP = 4.0
+
+        # 将大气模型加入当前动力学任务
+        self.simulator.AddModelToTask(self.task_name, self.msisAtmo)
+
+        # 2) 创建拖曳效应器并订阅 MSIS 密度
+        self.msisDragEff = dragDynamicEffector.DragDynamicEffector()  # 创建拖曳效应器实例
+        self.msisDragEff.ModelTag = "MSISDrag"
+
+        # DragDynamicEffector 的参数在 coreParams 结构下设置
+        area = getattr(self, "dragArea", 2.0)
+        cd = getattr(self, "dragCoeff", 2.2)
+        self.msisDragEff.coreParams.area = area  # 阻力面积
+        self.msisDragEff.coreParams.cd = cd  # 阻力系数
+
+        self.msisDragEff.atmoDensInMsg.subscribeTo(self.msisAtmo.envOutMsg)
+
+        # 挂到飞行器并加入任务
+        self.scObject.addDynamicEffector(self.msisDragEff)
+        self.simulator.AddModelToTask(self.task_name, self.msisDragEff)
+
+
 # 创建观测目标
 n_targets = 3000  # 目标数量
 n_ahead = 32 # 观测前瞻步数
@@ -67,7 +116,7 @@ def s_hat_H(sat):  #计算从卫星指向太阳的单位向量，并将其表示
     return r_SB_H / np.linalg.norm(r_SB_H)    # 返回归一化后的单位向量
 
 class ImagingSatellite(sats.ImagingSatellite):
-    observation_spec = [
+    observation_spec = [  # 创建观测空间
         obs.SatProperties(
             dict(prop="omega_BH_H", norm=0.03),
             dict(prop="c_hat_H"),
@@ -88,15 +137,18 @@ class ImagingSatellite(sats.ImagingSatellite):
             n_ahead_observe=n_ahead,
         )
     ]
-    action_spec = [act.Image(n_ahead_image=n_ahead),act.Charge()]  # 定义动作空间，现在是拍照
+    action_spec = [act.Image(n_ahead_image=n_ahead),
+                    act.Charge(duration=300),
+                    act.Downlink(duration=300)]  # 定义动作空间，现在是拍照
     
-    obs.Eclipse(norm=5700),
+    obs.Eclipse(norm=5700),  #日食
     Density(intervals=20, norm=5.0),  # 拍照的机会密度观测
     include_time = True
     if include_time == True:
         observation_spec.append(obs.Time())
 
-    dyn_type = dyn.FullFeaturedDynModel
+    dyn_type = MSISDynModel  # 使用自定义的 MSIS 动力学模型 
+    # dyn_type = dyn.FullFeaturedDynModel # 使用 bsk_rl 自带的 FullFeaturedDynModel 动力学模型
     fsw_type = fsw.SteeringImagerFSWModel
 
 
@@ -135,14 +187,17 @@ sat_args_power.update(
 
 # walker_delta_args 会生成一个函数，这个函数会在每次环境 reset 时被调用，以随机化卫星的初始轨道参数。
 # walker_delta_args 是 bsk_rl.utils.orbital 提供的一个辅助函数，用来生成 Walker 星座风格的轨道元素（orbit elements）。
-# 它返回一个“轨道生成器”（callable），按你给定的参数（如 altitude、inclination、n_planes 等）计算每颗卫星的轨道偏移/相位，用于在创建多星时给每颗卫星分配不同的初始轨道（即实现 Walker δ 星座布局）。
-sat_arg_randomizer = walker_delta_args(altitude=800.0, inc=60.0, n_planes=1)
+# 它返回一个“轨道生成器”（callable），按你给定的参数（如 altitude、inc、n_planes 等）计算每颗卫星的轨道偏移/相位，用于在创建多星时给每颗卫星分配不同的初始轨道（即实现 Walker δ 星座布局）。
+sat_arg_randomizer = walker_delta_args(altitude=800.0, inc=60.0, n_planes=1) 
 
 target_distribution = "uniform"  # 目标分布方式
 if target_distribution == "uniform":
-    targets = scene.UniformTargets(n_targets)  # 生成均匀分布的目标
+    targets = scene.UniformTargets(n_targets)  # 生成随意分布的目标
 elif target_distribution == "cities":
     targets = scene.CityTargets(n_targets)  # 生成城市分布的目标
+
+# 如何创建指定的地面站
+
 
 def episode_data_callback(env):  # 在每个 episode 结束时收集数据
     reward = env.rewarder.cum_reward
@@ -196,8 +251,16 @@ def make_leo_env_creator(n_sats, time_limit, sat_args, targets, sat_arg_randomiz
         ImagingSatellite("EO-7", sat_args),
         ImagingSatellite("EO-8", sat_args),
         ImagingSatellite("EO-9", sat_args),
-            ]
-        return GeneralSatelliteTasking(
+        ]
+
+        # 自定义地面站配置：lat/long 为度，elev 为米
+        gs_data = [
+            dict(name="GS_Alaska",   lat=64.0,  long=-147.5, elev=0.0),
+            dict(name="GS_Norway",   lat=69.0,  long=  18.9, elev=0.0),
+            dict(name="GS_Australia",lat=-35.3, long= 149.1, elev=0.0),
+        ]
+
+        return GeneralSatelliteTasking(   # GeneralSatelliteTasking 支持多卫星协同任务
             satellites=satellites,
             scenario=targets,
             rewarder=data.UniqueImageReward(),  # 唯一图像奖励，此奖励需要与生成目标的场景（如UniformTargets或CityTargets）一起使用。
@@ -206,7 +269,14 @@ def make_leo_env_creator(n_sats, time_limit, sat_args, targets, sat_arg_randomiz
             sat_arg_randomizer=sat_arg_randomizer,
             time_limit=time_limit,
             log_level="WARNING",  # 设置日志级别为 WARNING，避免过多输出，只显示警告和错误信息，INFO 级别会输出大量信息
-
+            
+            # 把 groundStationsData 传给 GroundStationWorldModel.setup_ground_locations
+            world_args=dict(
+                groundStationsData=gs_data,
+                # 如需修改最小仰角/最大距离，也可以在这里加：
+                gsMinimumElevation=np.radians(10.0),
+                gsMaximumRange=-1,  # 负值表示无限制 Set to ``-1`` to disable.
+            ),
             # 自己决定是否输出三维可视化，每一个episode都会生成一个文件，所以文件会很多
             vizard_dir="/workspace/learn_basilisk/vizard",
             vizard_settings=dict(showLocationLabels=0),  # 配置可视化动画
@@ -246,11 +316,10 @@ tune.run(
     "PPO",
     config=config.to_dict(),
     stop={"training_iteration": 20},  # Adjust the number of iterations as needed
-    checkpoint_freq=10,
+    checkpoint_freq=1,
     checkpoint_at_end=True,
     storage_path="/workspace/learn_basilisk/ray_results",
 )
 # Shutdown Ray
 ray.shutdown()
 
-    
